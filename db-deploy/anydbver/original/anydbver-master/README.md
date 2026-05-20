@@ -2,7 +2,6 @@
 Configuring MySQL, Percona MySQL/Postgresql/Mongo, MongoDB with ansible scripts.
 Running multi-node replication clusters in Docker and Kubernetes.
 
-
 # Installation
 1. Setup Docker, make sure that your user added to the docker group:
 2. Download anydbver binary for Linux (use Darvin for OSX (experimental))
