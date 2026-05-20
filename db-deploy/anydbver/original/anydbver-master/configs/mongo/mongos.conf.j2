@@ -1,0 +1,14 @@
+systemLog:
+  destination: file
+  logAppend: true
+  path: {{ mongos_log }}
+processManagement:
+  fork: true
+  pidFilePath: /var/run/mongod.pid
+sharding:
+  configDB: {{ mongos_cfg.split(',') | join(':27017,') + ':27017' if ':' not in mongos_cfg.split(',', 1)[1] else mongos_cfg }}
+security:
+  keyFile: "/etc/{{ mongos_keyfile }}"
+net:
+  port: 27017
+  bindIp: 0.0.0.0

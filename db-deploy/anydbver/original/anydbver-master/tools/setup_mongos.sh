@@ -1,0 +1,40 @@
+#!/bin/bash
+
+USR=$1 # dba
+PASS=$2 # secret
+SHARDSRV=$3 # rs0/10.76.129.55:27017,10.76.129.229:27017,10.76.129.3:27017
+
+KEYFILE=$(/vagrant/tools/yq .security.keyFile /etc/mongos.conf)
+KEYFILE_NAME=$(basename "$KEYFILE")
+cp "/vagrant/secret/$KEYFILE_NAME" "$KEYFILE"
+chmod 0400 "$KEYFILE"
+chown mongod:mongod "$KEYFILE"
+
+systemctl disable mongod
+systemctl stop mongod
+systemctl start mongos
+
+MONGO=/usr/bin/mongo;
+test -f $MONGO || MONGO=/usr/bin/mongosh;
+
+until $MONGO --eval 'print("waited for connection")' &>/dev/null ; do systemctl start mongos &>/dev/null; sleep 2 ; done
+
+FULL_NEW_SEP=$(echo "$SHARDSRV"|sed -re 's|,([^/^,]+/)|;\1|g')
+OLDIFS="$IFS"
+IFS=";"
+
+for SHARD_ITEM in $FULL_NEW_SEP ; do
+  SRV=$(echo "$SHARD_ITEM"| sed -re 's,[^/]+/([^,]+).*,\1,')
+  RS=$(echo "$SHARD_ITEM" | cut -d / -f 1)
+  until $MONGO -u dba -p secret --authenticationDatabase admin --norc "mongodb://$SRV" --eval 'rs.status()' |grep -q PRIMARY ; do sleep 1; done
+  until $MONGO -u "$USR" -p "$PASS" --authenticationDatabase admin --norc mongodb://127.0.0.1:27017/admin --eval "sh.status()" | egrep -q "\"$RS\"|'$RS'" ; do
+    $MONGO -u "$USR" -p "$PASS" --authenticationDatabase admin --norc mongodb://127.0.0.1:27017/admin --eval "sh.addShard('$SHARD_ITEM')"
+    sleep 1
+  done
+done
+
+$MONGO -u "$USR" -p "$PASS" --authenticationDatabase admin --norc mongodb://127.0.0.1:27017/admin --eval 'db.getSiblingDB("admin").createRole({ "role": "pbmAnyAction", "privileges": [ { "resource": { "anyResource": true }, "actions": [ "anyAction" ] } ], "roles": [] });db.grantRolesToUser("dba", [{role: "pbmAnyAction", db: "admin"}])'
+
+IFS=OLDIFS
+
+touch /root/mongos.configured

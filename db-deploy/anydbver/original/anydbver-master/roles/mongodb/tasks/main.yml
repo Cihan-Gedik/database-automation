@@ -1,0 +1,75 @@
+---
+# tasks file for mongodb
+- name: enable repo Percona Server for MongoDB
+  when: psmdb_version != ''
+  command:
+    cmd: /usr/bin/percona-release enable "{{package_info['repo_enable_str']}}"
+    creates: "/etc/yum.repos.d/percona-psmdb-{{pkg_major_no_dot}}-release.repo"
+
+- name: Enable MongoDB Community repository
+  when: mongo_org_version != ''
+  copy:
+    dest: "/etc/yum.repos.d/mongodb-org-{{pkg_major}}.repo"
+    content: |
+      [mongodb-org-{{pkg_major}}]
+      name=MongoDB Repository
+      baseurl=https://repo.mongodb.org/yum/redhat/$releasever/mongodb-org/{{pkg_major}}/{{ansible_architecture}}/
+      gpgcheck=0
+      enabled=1
+      gpgkey=https://www.mongodb.org/static/pgp/server-{{pkg_major}}.asc
+
+- name: Enable local repo.* caching
+  include_tasks: common/tasks/repo_cache.yaml
+
+- name: refresh percona repo
+  when: >
+    ( psmdb_version.startswith('3.0') or psmdb_version.startswith('3.6') or psmdb_version.startswith('4.0')
+    or psmdb_version.startswith('4.2') or psmdb_version.startswith('4.4') )
+    and (ansible_distribution == 'Debian' or ansible_distribution == 'Ubuntu') and is_percona_repo_required != ''
+  apt:
+    update_cache: yes
+
+- name: install Percona Server for MongoDB
+  when: psmdb_version != '' and not ( psmdb_version.startswith('3.2') or psmdb_version.startswith('3.4') )
+  package:
+    name: "{{ item }}"
+    state: present
+  with_items: "{{package_info['packages'].split('|')}}"
+
+- name: install Percona Server for MongoDB 3.2 or 3.4
+  when: psmdb_version.startswith('3.2') or psmdb_version.startswith('3.4')
+  package:
+    name: "{{ item }}"
+    state: present
+  with_items:
+    - "https://repo.percona.com/percona/yum/release/7/RPMS/x86_64/{{ psmdb_name }}{{ psmdb_major_ver }}-tools-{{ psmdb_version }}.{{ dist }}.x86_64.rpm"
+    - "https://repo.percona.com/percona/yum/release/7/RPMS/x86_64/{{ psmdb_name }}{{ psmdb_major_ver }}-shell-{{ psmdb_version }}.{{ dist }}.x86_64.rpm"
+    - "https://repo.percona.com/percona/yum/release/7/RPMS/x86_64/{{ psmdb_name }}{{ psmdb_major_ver }}-server-{{ psmdb_version }}.{{ dist }}.x86_64.rpm"
+    - "https://repo.percona.com/percona/yum/release/7/RPMS/x86_64/{{ psmdb_name }}{{ psmdb_major_ver }}-mongos-{{ psmdb_version }}.{{ dist }}.x86_64.rpm"
+    - "https://repo.percona.com/percona/yum/release/7/RPMS/x86_64/{{ psmdb_name }}{{ psmdb_major_ver }}-{{ psmdb_version }}.{{ dist }}.x86_64.rpm"
+
+- name: install MongoDB Community
+  when: mongo_org_version != ''
+  yum:
+    name: "{{pkg[dist].install_packages}}"
+    state: present
+
+
+- name: enable repo Percona Backup for MongoDB
+  when: pbm_version != ""
+  command:
+    cmd: /usr/bin/percona-release enable pbm release
+    creates: "/etc/yum.repos.d/percona-pbm-release.repo"
+
+- name: install Percona Backup for MongoDB
+  when: pbm_version != ""
+  yum:
+    name: "percona-backup-mongodb-{{percona_backup_mongodb_ver}}"
+    state: present
+    disable_gpg_check: yes
+
+- name: MongoDB Setup tasks
+  when: install_only == ''
+  include_tasks: setup.yaml
+
+

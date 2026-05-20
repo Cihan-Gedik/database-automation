@@ -1,0 +1,209 @@
+---
+# tasks file for mysql
+- name: "Package info sql"
+  ansible.builtin.debug:
+    msg: "{{ package_info_sql }}"
+- name: "Package info"
+  ansible.builtin.debug:
+    msg: "{{ package_info }}"
+
+- name: Enable EPEL
+  when: >
+    (orchestrator_version != '' or percona_orchestrator_version != ''
+     or mysql_ndb_data_version != '' or mysql_ndb_sql_version != '' or mysql_ndb_management_version != '') and
+    (ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux')
+  package:
+    name: epel-release
+    state: present
+- name: Enable EPEL (Oracle Linux 7)
+  when: ansible_distribution == 'OracleLinux' and dist == 'el7'
+  yum_repository:
+    name: epel
+    description: EPEL YUM repo
+    baseurl: https://yum.oracle.com/repo/OracleLinux/OL7/developer_EPEL/$basearch/
+    gpgkey: file:///etc/pki/rpm-gpg/RPM-GPG-KEY-oracle
+- name: enable Percona MySQL 8.0 distribution repo
+  when: percona_orchestrator_version != ''
+  shell:
+    cmd: >-
+      sed -i -e 's/SUPPORTED_ARCHS="i386 noarch x86_64 sources"/SUPPORTED_ARCHS="i386 noarch x86_64 aarch64 sources"/' /usr/bin/percona-release;
+      /usr/bin/percona-release enable pdps-8.0;
+      touch /root/pdps-80.enabled
+    creates: /root/pdps-80.enabled
+  register: percona_release_enabled
+
+- name: enable Percona MySQL repo
+  when: percona_server_version != '' or percona_xtradb_cluster_version != ''
+  shell:
+    cmd: >-
+      sed -i -e 's/SUPPORTED_ARCHS="i386 noarch x86_64 sources"/SUPPORTED_ARCHS="i386 noarch x86_64 aarch64 sources"/' /usr/bin/percona-release;
+      /usr/bin/percona-release enable "{{package_info['repo_enable_str'] if package_info else os[dist][soft].repo_enable_str }}"
+    creates: "{{ package_info['repo_file'] if package_info else os[dist][soft].repo_file }}"
+  register: percona_release_enabled
+
+- name: Enable PXB 2.4 for PXC 5.7
+  when: percona_xtradb_cluster_version.startswith("5.7")
+  shell:
+    cmd: >-
+      percona-release enable pxb-24;
+  
+- name: MySQL repo
+  when: mysql_version != '' or mysql_router_version != '' or mysql_ndb_data_version != '' or mysql_ndb_sql_version != '' or mysql_ndb_management_version != ''
+  block:
+    - name: MySQL 8.0 yum repo
+      when: >
+        (ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux' or ansible_distribution == 'OracleLinux')
+      yum:
+        name: "{{package_info['repo_url']}}"
+        disable_gpg_check: yes
+        state: present
+    - name: Enable mysql innovation releases
+      when: >
+        ( mysql_version.startswith('8.1') or mysql_version.startswith('8.2') or mysql_version.startswith('8.3') ) and
+        (ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux' or ansible_distribution == 'OracleLinux')
+      shell:
+        cmd: "dnf config-manager --disable mysql80-community; dnf config-manager --enable mysql-innovation-community"
+    - name: Switch mysql ndb cluster 8.0 repo
+      when: >
+        ( mysql_ndb_data_version.startswith('8.0') or mysql_ndb_sql_version.startswith('8.0') or mysql_ndb_management_version.startswith('8.0') ) and
+        (ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux' or ansible_distribution == 'OracleLinux')
+      shell:
+        cmd: "yum-config-manager --disable mysql80-community; yum-config-manager --enable mysql-cluster-8.0-community"
+    - name: Switch mysql repo 5.7
+      when: >
+        mysql_version.startswith('5.7') and
+        (ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux' or ansible_distribution == 'OracleLinux')
+      shell:
+        cmd: "yum-config-manager --disable mysql80-community; yum-config-manager --enable mysql57-community"
+    - name: Switch mysql repo 5.6
+      when: >
+        mysql_version.startswith('5.6') and
+        (ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux' or ansible_distribution == 'OracleLinux')
+      shell:
+        cmd: "yum-config-manager --disable mysql80-community; yum-config-manager --enable mysql56-community"
+    - name: Install apt repository
+      when: (ansible_distribution == 'Debian' or ansible_distribution == 'Ubuntu') 
+      apt:
+        deb: "{{package_info['repo_url']}}"
+
+
+- name: Disable Redhat MySQL module
+  when: (mysql_version != '' or mysql_router_version != '' or percona_server_version != '' or percona_xtradb_cluster_version != '') and dist == 'el8'
+  command:
+    cmd: dnf -y module disable mysql
+
+- name: Enable ProxySQL repo
+  when: >
+    proxysql_version != '' and
+    (ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux' or ansible_distribution == 'OracleLinux')
+  ansible.builtin.template:
+    src: roles/mysql/templates/proxysql.repo.j2
+    dest: /etc/yum.repos.d/proxysql.repo
+
+- name: Enable Percona ProxySQL repo
+  when: percona_proxysql_version != ''
+  command:
+    cmd: /usr/bin/percona-release enable proxysql
+
+- name: Enable local repo.* caching
+  include_tasks: common/tasks/repo_cache.yaml
+
+- name: Install db packages
+  when: percona_server_version == '' and percona_xtradb_cluster_version == '' and mysql_version == '' and mysql_router_version == ''
+  include_tasks: common/tasks/install_db_packages.yml
+
+- name: Install db packages (sqlite metadata)
+  when: percona_server_version != '' or percona_xtradb_cluster_version != '' or mysql_version != '' or mysql_router_version != '' or mydb_version != ''
+  block:
+  - name: enable Percona Distribution for Percona Server MySQL 8.0 repo
+    when: ( percona_server_version.startswith('8.0') or percona_xtradb_cluster_version.startswith('8.0') )
+    command:
+      cmd: /usr/bin/percona-release enable "pdps-8.0"
+      creates: "/etc/yum.repos.d/percona-pdps-8.0-release.repo"
+  - name: install db packages
+    when: >
+      ( percona_server_version != "" or percona_xtradb_cluster_version != "" or mysql_version != "" or mysql_router_version != "" or mydb_version != '') and
+      (ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux' or ansible_distribution == 'OracleLinux')
+    yum:
+      name: "{{ package_info['packages'].split('|') + ( [] if debug_packages == '' else package_info['debug_packages'].split('|')) + ( [] if replication_type != 'group' or soft == 'proxysql' else package_info['mysql_shell_packages'].split('|') ) + ( [] if not ('development' in db_features.split(',') and 'development_packages' in os[dist][soft]) else os[dist][soft].development_packages) + ( [] if not ( mysql_ndb_data_version != '' ) else os[dist][soft].data_packages ) + ( [] if not ( mysql_ndb_sql_version != '' ) else os[dist][soft].sql_packages ) + ( [] if not ( mysql_ndb_management_version != '' ) else os[dist][soft].management_packages ) + ( [] if not ( tests_enabled|bool and 'tests_packages' in os[dist][soft] ) else os[dist][soft].tests_packages) + ( [] if not ( tests_enabled|bool and 'tests_packages' in os[dist][soft] ) else package_info['tests_packages'].split('|')) + ( [] if not ( rocksdb_enabled|bool and 'rocksdb_packages' in package_info ) else package_info['rocksdb_packages'].split('|'))  + ( [] if not ( mysql_router_version != '' and 'mysql_router_packages' in package_info ) else package_info['mysql_router_packages'].split('|'))  }}"
+      state: present
+      disable_gpg_check: 'yes'
+  - name: install db packages (deb)
+    when: >
+      ( percona_server_version != "" or percona_xtradb_cluster_version != "" or mysql_version != "" or mydb_version != "") and
+      (ansible_distribution == 'Debian' or ansible_distribution == 'Ubuntu') 
+    apt:
+      deb: "{{item}}"
+      update_cache: true
+    with_items: "{{ package_info['packages'].split('|') + ( [] if debug_packages == '' else package_info['debug_packages'].split('|')) + ( [] if replication_type != 'group' or soft == 'proxysql' else package_info['mysql_shell_packages'].split('|') ) + ( [] if not ('development' in db_features.split(',') and 'development_packages' in os[dist][soft]) else os[dist][soft].development_packages) + ( [] if not ( mysql_ndb_data_version != '' ) else os[dist][soft].data_packages ) + ( [] if not ( mysql_ndb_sql_version != '' ) else os[dist][soft].sql_packages ) + ( [] if not ( mysql_ndb_management_version != '' ) else os[dist][soft].management_packages ) + ( [] if not ( tests_enabled|bool and 'tests_packages' in os[dist][soft] ) else os[dist][soft].tests_packages) + ( [] if not ( tests_enabled|bool and 'tests_packages' in os[dist][soft] ) else package_info['tests_packages'].split('|')) + ( [] if not ( rocksdb_enabled|bool and 'rocksdb_packages' in package_info ) else package_info['rocksdb_packages'].split('|'))  }}"
+
+
+- name: Install Garbd
+  when: ('garbd' in db_features.split(',')) and (ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux' or ansible_distribution == 'OracleLinux')
+  package:
+    name: "{{ item }}"
+    state: present
+  with_items: "{{ package_info['garbd_packages'] if package_info else os[dist][soft].garbd_packages }}"
+
+- name: Setup and start Garbd
+  when: master_ip != '' and ('garbd' in db_features.split(','))
+  command:
+    cmd: /bin/bash /vagrant/tools/setup_garbd.sh "{{ master_ip }}" root "{{ db_password }}" "{{'cluster1' if cluster_name == '' else cluster_name}}"
+    creates: /root/garbd.configured
+
+- name: install Percona XtraBackup
+  when: percona_xtrabackup_version != "" and "packages" in xtrabackup_package_info
+  package:
+    name: "{{ item }}"
+    state: present
+  with_items: "{{ xtrabackup_package_info['packages'] }}"
+
+- name: InnoDB ruby
+  when: innodb_ruby_version != ''
+  block:
+    - name: install ruby and gem
+      package:
+        name: ruby
+        state: present
+    - name: install innodb_ruby
+      command:
+        cmd: /usr/bin/gem install innodb_ruby
+        creates: /usr/local/bin/innodb_space
+
+- name: install mysql_random_data_load
+  when: mysql_random_data_load_version != ''
+  shell:
+    warn: false
+    cmd: >-
+      curl -sL https://github.com/Percona-Lab/mysql_random_data_load/releases/download/v{{mysql_random_data_load_version}}/mysql_random_data_load_{{mysql_random_data_load_version}}_Linux_x86_64.tar.gz
+      | tar -C /usr/local/bin -xz mysql_random_data_load
+    creates: /usr/local/bin/mysql_random_data_load
+
+- name: Install mydumper
+  when: (ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux' or ansible_distribution == 'OracleLinux') and mydumper_version != ''
+  yum:
+    name: "{{mydumper[dist].install_packages}}"
+    state: present
+    disable_gpg_check: yes
+- name: Install mydumper (deb)
+  when: (ansible_distribution == 'Debian' or ansible_distribution == 'Ubuntu') and mydumper_version != ''
+  apt:
+    deb: "{{mydumper[dist].install_packages}}"
+
+- name: Install MySQL connector java
+  when: mysql_connector_java_version != ''
+  package:
+    name: "{{ item }}"
+    state: present
+    disable_gpg_check: yes
+  with_items: "{{os[dist].mysql_connector_java.install_packages}}"
+
+- name: Install MySQL connector .Net
+  when: mysql_dot_net != ''
+  command:
+    cmd: /bin/bash /vagrant/tools/setup_dotnet.sh "{{mysql_dot_net}}"
+
+
+- name: MySQL Setup tasks
+  when: install_only == ''
+  include_tasks: setup.yaml

@@ -1,0 +1,367 @@
+# https://bugzilla.redhat.com/show_bug.cgi?id=1875056
+- stat: path="/root/{{ db_opts_file | basename }}.applied"
+  register: pg_opt_file
+- name: Configure Postgresql
+  when: not pg_opt_file.stat.exists
+  block:
+    - name: Directory for pg systemd service override
+      file:
+        path: "/etc/systemd/system/{{pg_systemd_svc}}.service.d"
+        state: directory
+    - name: Disable killmode=mixed in pg systemd service
+      copy:
+        dest: "/etc/systemd/system/{{pg_systemd_svc}}.service.d/override.conf"
+        content: |
+          [Service]
+          KillMode=process
+    - name: refresh pg systemd service
+      systemd:
+        daemon_reload: yes
+    - name: Stop postgresql database if running
+      command:
+        cmd: systemctl stop "{{package_info['systemd_service']}}"
+
+    - name: Create Postgres Database
+      when: (percona_postgresql_version != '' or postgresql_version != '' ) and db_password != "" and patroni_version == ''
+      shell:
+        cmd: >-
+          echo {{ db_password }} > /tmp/root-pw.txt;
+          echo export PGUSER=postgres PGHOSTADDR=$(node_ip.sh) PGHOST=$(node_ip.sh) >> /root/.bash_profile;
+          PGSETUP_INITDB_OPTIONS="--pwfile=/tmp/root-pw.txt {{ '' if pmm_url == '' else '-A md5' }}" /usr/pgsql-{{maj}}/bin/postgresql{{'95' if postgresql_version.startswith('9.5') else '96' if postgresql_version.startswith('9.6') else '-'+maj}}-setup initdb;
+          sed -r -i -e 's/local\s+all\s+all\s+peer/local   all             all                                     peer\nlocal   all             repmgr                                  md5/' {{pg_conf_dir}}/pg_hba.conf ;
+          echo "listen_addresses = '*'" >> {{pg_conf_dir}}/postgresql.conf;
+          echo 'host    all             all             0.0.0.0/0            {{'md5' if ldap_server_ip == '' else 'ldap ldapurl="ldap://'+ldap_server_ip+':389/dc=percona,dc=local?uid?sub"' }}' >> {{pg_conf_dir}}/pg_hba.conf;
+          echo 'host    replication     all             0.0.0.0/0            md5' >> {{pg_conf_dir}}/pg_hba.conf;
+          echo 'host    replication     all             127.0.0.1/32         md5' >> {{pg_conf_dir}}/pg_hba.conf;
+          echo 'host    replication     all             ::1/128              md5' >> {{pg_conf_dir}}/pg_hba.conf;
+          echo 'host    all             all             127.0.0.1/32         md5' >> {{pg_conf_dir}}/pg_hba.conf;
+          echo 'host    all             all             ::1/128              md5' >> {{pg_conf_dir}}/pg_hba.conf;
+          sed -i -r -e 's/^(host.*ident)/#\1/' {{pg_conf_dir}}/pg_hba.conf;
+          echo $(/bin/bash /vagrant/tools/node_ip.sh):5432:*:postgres:{{db_password}} > ~/.pgpass ;
+          echo 127.0.0.1:5432:*:postgres:{{db_password}} >> ~/.pgpass ;
+          chmod 0600 ~/.pgpass
+        creates: "/root/.pgpass"
+
+    - name: Apply database options from file
+      when: db_opts_file != '' and (postgresql_version != '' or percona_postgresql_version != '')
+      shell:
+        cmd: >-
+          cat "/vagrant/configs/{{ db_opts_file }}" >> "{{pg_conf_dir}}/postgresql.conf";
+          touch "/root/{{ db_opts_file | basename }}.applied"
+        creates: "/root/{{ db_opts_file | basename }}.applied"
+
+    - name: Setup Kerberos for PG
+      when: kerberos_client != '' and (postgresql_version != '' or percona_postgresql_version != '')
+      command:
+        cmd: /bin/bash /vagrant/tools/setup_pg_kerberos.sh "{{db_user}}" "{{db_password}}"
+        creates: /etc/sysconfig/pgsql/krb5.keytab
+
+    - name: Setup Kerberos for PG (Samba)
+      when: kerberos_samba_ip != '' and (postgresql_version != '' or percona_postgresql_version != '')
+      command:
+        cmd: /bin/bash /vagrant/tools/setup_pg_kerberos_samba.sh "{{kerberos_samba_ip}}" "{{db_password}}" "{{maj}}"
+        creates: /root/kerberos-pg.configured
+
+    - name: Start database with systemd (logical replication or master)
+      when: (replication_type == 'logical' or master_ip == '') and patroni_version == ''
+      command:
+        cmd: systemctl start "{{package_info['systemd_service']}}"
+
+    - name: change postgresql password on debian-based
+      when: (ansible_distribution == 'Debian' or ansible_distribution == 'Ubuntu') and (replication_type == 'logical' or master_ip == '') and patroni_version == ''
+      shell:
+        cmd: sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '{{ db_password }}'"
+
+    - name: Setup and start Postgresql replication
+      when: master_ip != '' and ( percona_postgresql_version != '' or postgresql_version != '') and patroni_version == ''
+      vars:
+        maj: "{{'9.5' if postgresql_version.startswith('9.5') else '9.6' if postgresql_version.startswith('9.6') else postgresql_version|regex_replace('^([0-9]+)\\..*$','\\1') if postgresql_version != '' else percona_postgresql_version|regex_replace('^([0-9]+)\\..*$','\\1')   }}"
+      shell:
+        cmd: >-
+          /bin/bash /vagrant/tools/setup_postgresql_replication.sh
+          {{replication_type if replication_type !='' else 'streaming_physical_slots'}}
+          {{master_ip}}
+          postgres
+          {{db_password}}
+          postgres
+          {{pg_data_dir}}
+          postgresql-{{maj}}
+          {{pg_logical_db}}
+        creates: /root/replication.configured
+
+- name: Start database with systemd
+  when: patroni_version == ''
+  command:
+    cmd: systemctl start "{{package_info['systemd_service']}}"
+
+- name: Create LDAP user in postgres
+  when: (postgresql_version != '' or percona_postgresql_version != '') and ldap_server_ip != '' and db_user != ''
+  shell:
+    cmd: >-
+      sudo -u postgres createuser "{{db_user}}";
+      sudo -u postgres psql -c 'grant all on database postgres to {{db_user}}';
+
+- name: Postgres Samba Active Directory
+  when: samba_ip != '' and samba_pass != '' and samba_sid != '' and (postgresql_version != '' or percona_postgresql_version != '')
+  shell:
+    cmd: /bin/bash /vagrant/tools/setup_samba_ldap_client.sh "{{samba_ip}}" "{{samba_pass}}" "{{samba_sid}}" pg "{{ os[dist][soft].cnf_file }}" "{{ os[dist][soft].systemd_service if soft else db_systemd_service }}"
+
+
+- name: Setup Odyssey
+  when: odyssey_version != '' and master_ip != ''
+  shell:
+    cmd: /bin/bash /vagrant/tools/setup_pg_odyssey.sh "{{master_ip}}" "{{db_password}}"
+    creates: /etc/odyssey/odyssey.conf
+
+- name: Install pg_stat_monitor extension
+  when: pg_stat_monitor != '' and 'development' in db_features.split(',')
+  command:
+    cmd: /bin/bash /vagrant/tools/install_pg_stat_monitor.sh "{{ pkg[dist].systemd if ('systemd' in pkg[dist]) and percona_postgresql_version !='' else os[dist][soft].systemd_service if soft else db_systemd_service }}"
+    creates: /root/pg_stat_monitor.installed
+
+- name: Setup PMM client with postgres
+  when: pmm_url != '' and (postgresql_version != '' or percona_postgresql_version != '') and patroni_version == ''
+  shell:
+    cmd: /bin/bash -e /vagrant/tools/setup_pmm.sh "{{soft}}" postgres "{{db_password}}" pmm_user "{{db_password}}" "{{pg_systemd_svc}}" "{{ 'yes' if pmm_client_version != '' and (percona_postgresql_version.startswith('11.') or percona_postgresql_version.startswith('12.') or percona_postgresql_version.startswith('13.') or pg_stat_monitor != '' ) else 'no' }}"
+    creates: /root/pmm-postgresql.applied
+
+- name: Setup PGPool
+  when: pgpool_version != '' and backend_ip != ''
+  shell:
+    cmd: /bin/bash /vagrant/tools/setup_pg_pool.sh "{{backend_ip}}" "{{db_password}}"
+    creates: /root/pgpool.applied
+
+- name: Enable xinetd 
+  when: (postgresql_version != '' or percona_postgresql_version != '') and ('clustercheck' in db_features.split(','))
+  block:
+    - name: create haproxy config from template
+      template:
+        src: "{{playbook_dir}}/roles/postgresql/templates/pgsqlchk.j2"
+        dest: "/usr/local/bin/pgsqlchk"
+        mode: '0755'
+    - name: install xinetd
+      package:
+        name: xinetd
+        state: present
+    - name: Create xinetd service
+      copy:
+        src: "{{playbook_dir}}/roles/haproxy/files/pgchk"
+        dest: /etc/xinetd.d/pgchk
+    - name: Xinetd systemd override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/xinetd.service.d
+        state: directory
+    - name: Reduce nofiles for xinetd
+      copy:
+        src: "{{playbook_dir}}/roles/haproxy/files/ulimit.conf"
+        dest: /etc/systemd/system/xinetd.service.d/ulimit.conf
+    - name: refresh pg systemd service
+      systemd:
+        daemon_reload: yes
+    - name: start xinetd
+      systemd:
+        name: xinetd
+        state: restarted
+        enabled: True
+
+# archive_mode = 'on'
+# archive_command = 'source /etc/wal-g.env && /usr/bin/wal-g wal-push %p'
+# archive_timeout = '60'
+# restore_command = 'source /etc/wal-g.env && /usr/bin/wal-g wal-fetch %f %p'
+- name: Setup WAL-G and MinIO
+  when: walg_version != '' and minio_url != ''
+  block:
+    - name: Create WAL-G environment file
+      copy:
+        dest: /etc/wal-g.env
+        owner: root
+        group: postgres
+        mode: 0660
+        content: |
+          export AWS_ACCESS_KEY_ID="UkVQTEFDRS1XSVRILUFXUy1BQ0NFU1MtS0VZ"
+          export AWS_SECRET_ACCESS_KEY="UkVQTEFDRS1XSVRILUFXUy1TRUNSRVQtS0VZ"
+          export AWS_ENDPOINT={{ minio_url }}
+          export AWS_REGION=us-east-1
+          export AWS_S3_FORCE_PATH_STYLE=true
+          export WALE_S3_PREFIX=s3://backup
+          export PGHOST=$(node_ip.sh)
+    - name: Enable archiving in postgresql.conf
+      blockinfile:
+        path: "{{pg_conf_dir}}/postgresql.conf"
+        block: |
+          archive_mode = 'on'
+          archive_command = 'source /etc/wal-g.env && /usr/bin/wal-g wal-push %p'
+          archive_timeout = '60'
+          restore_command = 'source /etc/wal-g.env && /usr/bin/wal-g wal-fetch %f %p'
+    - name: restart postgresql
+      systemd:
+        name: "{{pg_systemd_svc}}"
+        state: restarted
+        enabled: True
+
+
+- name: pgBackRest filesystem backups
+  when: pgbackrest_version != ''
+  block:
+    - name: pgBackRest stansa information
+      when: minio_url == ''
+      copy:
+        dest: /etc/pgbackrest.conf
+        owner: root
+        group: postgres
+        mode: 0660
+        content: |
+          [global]
+          repo1-path=/var/lib/pgbackrest
+          repo1-retention-full=2
+          [db]
+          pg1-path=/var/lib/pgsql/{{maj}}/data
+          pg1-port=5432
+          # sudo -u postgres pgbackrest stanza-create --stanza=db --log-level-console=info
+          # sudo -u postgres pgbackrest check --stanza=db --log-level-console=info
+          # sudo -u postgres pgbackrest backup --stanza=db --log-level-console=info
+          # sudo -u postgres pgbackrest info
+          # pgbackrest restore --stanza=db --log-level-console=info
+    - name: pgBackRest stansa information (minio)
+      when: minio_url != ''
+      copy:
+        dest: /etc/pgbackrest.conf
+        owner: root
+        group: postgres
+        mode: 0660
+        content: |
+          [global]
+          repo1-path = /pgbackrest/repo1
+          repo1-type=s3
+          repo1-s3-endpoint={{ minio_url | urlsplit('hostname')}}
+          repo1-storage-host={{ minio_url | urlsplit('hostname')}}
+          repo1-storage-port={{ minio_url | urlsplit('port')}}
+          repo1-s3-bucket=backup
+          repo1-s3-verify-tls=n
+          repo1-s3-key={{ minio_url | urlsplit('username')}}
+          repo1-s3-key-secret={{ minio_url | urlsplit('password')}}
+          repo1-s3-region=us-east-1
+          repo1-s3-uri-style=path
+          repo1-retention-full=2
+          [db]
+          pg1-path=/var/lib/pgsql/{{maj}}/data
+          pg1-port=5432
+          # sudo -u postgres pgbackrest stanza-create --stanza=db --log-level-console=info
+          # sudo -u postgres pgbackrest check --stanza=db --log-level-console=info
+          # sudo -u postgres pgbackrest backup --stanza=db --log-level-console=info
+          # sudo -u postgres pgbackrest info
+          # sudo -u postgres pgbackrest restore --stanza=db --log-level-console=info
+    - name: Enable archiving in postgresql.conf
+      when: patroni_version == ''
+      blockinfile:
+        path: "{{pg_conf_dir}}/postgresql.conf"
+        block: |
+          archive_mode = 'on'
+          archive_command = 'pgbackrest --stanza=db archive-push %p'
+          archive_timeout = '60'
+    - name: restart postgresql
+      when: patroni_version == ''
+      systemd:
+        name: "{{pg_systemd_svc}}"
+        state: restarted
+        enabled: True
+    - name: Create stanza
+      when: patroni_version == '' and (db_systemd_service != '' or (soft != '' and os[dist][soft].systemd_service))
+      command:
+        cmd: sudo -u postgres pgbackrest stanza-create --stanza=db --log-level-console=info
+
+- name: Load database from S3
+  when: s3sql != ''
+  load_sql_from_s3:
+    s3_sql: "{{ s3sql }}"
+    client: psql -U postgres -h 127.0.0.1
+
+- name: setup Repmgr master
+  when: repmgr_version != '' and postgresql_version != '' and master_ip == ''
+  shell:
+    cmd: |
+      until sudo -iu postgres /usr/pgsql-{{maj}}/bin/pg_isready ; do sleep 1 ; done
+      cat >> /etc/repmgr/{{maj}}/repmgr.conf <<EOF
+      node_id=$(( 10 + $(hostname | sed -e 's/.*node//' -e 's/default/0/') ))
+      node_name=$(hostname)
+      conninfo='host=$(hostname) user=repmgr dbname=repmgr connect_timeout=2'
+      data_directory='/var/lib/pgsql/{{maj}}/data/'
+      failover=automatic
+      promote_command='/usr/pgsql-{{maj}}/bin/repmgr standby promote -f /etc/repmgr/{{maj}}/repmgr.conf --log-to-file'
+      follow_command='/usr/pgsql-{{maj}}/bin/repmgr standby follow -f /etc/repmgr/{{maj}}/repmgr.conf --log-to-file --upstream-node-id=%n'
+      service_start_command = 'sudo /usr/bin/systemctl start postgresql-{{maj}}'
+      service_stop_command = 'sudo /usr/bin/systemctl stop postgresql-{{maj}}'
+      service_restart_command = 'sudo /usr/bin/systemctl restart postgresql-{{maj}}'
+      service_reload_command = 'sudo /usr/bin/systemctl reload postgresql-{{maj}}'
+      service_promote_command = '/usr/pgsql-{{maj}}/bin/pg_ctl -D /var/lib/pgsql/{{maj}}/data promote'
+      EOF
+      cat >> /etc/sudoers <<EOF
+      postgres ALL = NOPASSWD: /usr/bin/systemctl start postgresql-{{maj}}
+      postgres ALL = NOPASSWD: /usr/bin/systemctl restart postgresql-{{maj}}
+      postgres ALL = NOPASSWD: /usr/bin/systemctl reload postgresql-{{maj}}
+      postgres ALL = NOPASSWD: /usr/bin/systemctl stop postgresql-{{maj}}
+      EOF
+      cat >>  /var/lib/pgsql/.pgpass <<EOF
+      *:*:*:*:{{db_password}}
+      EOF
+      chmod 0600 /var/lib/pgsql/.pgpass
+      chown postgres:postgres /var/lib/pgsql/.pgpass
+      sudo -iu postgres createuser --replication --createdb --createrole --superuser repmgr
+      sudo -iu postgres createdb repmgr --owner=repmgr
+      sudo -iu postgres psql -c "ALTER USER repmgr WITH PASSWORD '{{db_password}}';"
+      cat >> /var/lib/pgsql/{{maj}}/data/postgresql.conf <<EOF
+      hot_standby = on
+      shared_preload_libraries = 'repmgr'
+      EOF
+        /usr/bin/systemctl restart postgresql-{{maj}}
+        until sudo -iu postgres /usr/pgsql-{{maj}}/bin/pg_isready ; do sleep 1 ; done
+        until sudo -iu postgres /usr/pgsql-{{maj}}/bin/repmgr primary register ; do sleep 1 ; done
+
+      systemctl daemon-reload
+      systemctl enable repmgr-{{maj}}
+      systemctl start repmgr-{{maj}}
+
+
+- name: setup Repmgr replica
+  when: repmgr_version != '' and postgresql_version != '' and master_ip != ''
+  shell:
+    cmd: |
+      cat >>  /var/lib/pgsql/.pgpass <<EOF
+      *:*:*:*:{{db_password}}
+      EOF
+      chmod 0600 /var/lib/pgsql/.pgpass
+      chown postgres:postgres /var/lib/pgsql/.pgpass
+
+      until sudo -iu postgres /usr/pgsql-{{maj}}/bin/pg_isready -U repmgr -d repmgr &>/dev/null ; do sleep 1 ; done
+      cat >> /etc/repmgr/{{maj}}/repmgr.conf <<EOF
+      node_id= $(( 10 + $(hostname | sed -e 's/.*node//' -e 's/default/0/') ))
+      node_name=$(hostname)
+      conninfo='host=$(hostname) user=repmgr dbname=repmgr connect_timeout=2'
+      data_directory='/var/lib/pgsql/{{maj}}/data/'
+      failover=automatic
+      promote_command='/usr/pgsql-{{maj}}/bin/repmgr standby promote -f /etc/repmgr/{{maj}}/repmgr.conf --log-to-file'
+      follow_command='/usr/pgsql-{{maj}}/bin/repmgr standby follow -f /etc/repmgr/{{maj}}/repmgr.conf --log-to-file --upstream-node-id=%n'
+      service_start_command = 'sudo /usr/bin/systemctl start postgresql-{{maj}}'
+      service_stop_command = 'sudo /usr/bin/systemctl stop postgresql-{{maj}}'
+      service_restart_command = 'sudo /usr/bin/systemctl restart postgresql-{{maj}}'
+      service_reload_command = 'sudo /usr/bin/systemctl reload postgresql-{{maj}}'
+      service_promote_command = '/usr/pgsql-{{maj}}/bin/pg_ctl -D /var/lib/pgsql/{{maj}}/data promote'
+      EOF
+      cat >> /etc/sudoers <<EOF
+      postgres ALL = NOPASSWD: /usr/bin/systemctl start postgresql-{{maj}}
+      postgres ALL = NOPASSWD: /usr/bin/systemctl restart postgresql-{{maj}}
+      postgres ALL = NOPASSWD: /usr/bin/systemctl reload postgresql-{{maj}}
+      postgres ALL = NOPASSWD: /usr/bin/systemctl stop postgresql-{{maj}}
+      EOF
+        until sudo -iu postgres /usr/pgsql-{{maj}}/bin/pg_isready -h {{master_ip}} -U repmgr -d repmgr ; do sleep 1 ; done
+        /usr/bin/systemctl stop postgresql-{{maj}}
+        sudo -iu postgres /usr/pgsql-{{maj}}/bin/repmgr -h {{master_ip}} -U repmgr -d repmgr standby clone --force --fast-checkpoint
+        /usr/bin/systemctl start postgresql-{{maj}}
+        until sudo -iu postgres /usr/pgsql-{{maj}}/bin/pg_isready ; do sleep 1 ; done
+        until sudo -iu postgres /usr/pgsql-{{maj}}/bin/repmgr standby register -F ; do sleep 1 ; done
+      systemctl daemon-reload
+      systemctl enable repmgr-{{maj}}
+      until sudo -iu postgres /usr/pgsql-{{maj}}/bin/pg_isready -U repmgr -d repmgr &>/dev/null ; do sleep 1 ; done
+      for i in 1 2 3 4 5 6 7 8 9 10 ; do systemctl start repmgr-{{maj}} && break || sleep 3; done
+
+      

@@ -1,0 +1,48 @@
+- name: add private registry for k3s
+  command:
+    warn: false
+    cmd: /bin/bash /vagrant/tools/setup_k3s_docker_registry.sh "{{k3s_registry}}"
+
+- name: Download k3s kubernetes distribution
+  uri:
+    url: "{{ 'https://github.com/rancher/k3s/releases/download/v'+k3s_version+'%2Bk3s1/k3s' if k3s_version != '' and k3s_version != 'latest' else os.k3s.latest_url }}"
+    dest: /usr/local/bin/k3s
+    mode: '0755'
+    follow_redirects: all
+    creates: /usr/local/bin/k3s
+- name: Download k3s systemd service
+  get_url:
+    url: https://raw.githubusercontent.com/rancher/k3s/master/k3s.service
+    dest: "/opt/k3s{{ '' if k3s_url == '' else '-agent' }}.service"
+    mode: '0644'
+- name: Make a copy for downloaded k3s.service
+  copy:
+    src: "/opt/k3s{{ '' if k3s_url == '' else '-agent' }}.service"
+    dest: "/etc/systemd/system/k3s{{ '' if k3s_url == '' else '-agent' }}.service"
+    force: no
+    remote_src: yes
+    mode: '0644'
+- name: Fix k3s apparmor
+  command:
+    warn: false
+    cmd: >-
+      sed -i -e "/ExecStartPre/a ExecStartPre=-/bin/sh -xc 'test -f /sys/module/apparmor/parameters/enabled && mount --bind /tmp /sys/module/apparmor'" "/etc/systemd/system/k3s{{ '' if k3s_url == '' else '-agent' }}.service"
+- name: check /dev/kmsg exists
+  stat:
+    path: /dev/kmsg
+  register: kmsg
+- name: Fix k3s /dev/kmsg symlink
+  when: kmsg.stat.exists == False
+  file:
+    src: /dev/console
+    dest: /dev/kmsg
+    state: link
+- name: Create kubectl symlink
+  file:
+    src: /usr/local/bin/k3s
+    dest: /usr/bin/kubectl
+    state: link
+
+- name: Kubernetes Setup tasks
+  when: install_only == ''
+  include_tasks: kubernetes_setup.yaml

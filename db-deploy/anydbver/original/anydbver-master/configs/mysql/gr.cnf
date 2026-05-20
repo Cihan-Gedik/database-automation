@@ -1,0 +1,17 @@
+[mysqld]
+innodb_buffer_pool_size=512M
+server_id=55
+report_host=myhost
+log-bin=mysqld-bin
+binlog_checksum=NONE
+enforce_gtid_consistency=ON
+gtid_mode=ON
+loose-log-slave-updates
+loose-log_replica_updates=ON
+loose-transaction_write_set_extraction=XXHASH64
+loose-master_info_repository=TABLE
+loose-relay_log_info_repository=TABLE
+loose-binlog_transaction_dependency_tracking=WRITESET
+loose-slave_parallel_type=LOGICAL_CLOCK
+loose-slave_preserve_commit_order=ON
+loose-mysql_native_password=ON

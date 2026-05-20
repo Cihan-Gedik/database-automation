@@ -1,0 +1,79 @@
+---
+# tasks file for kubernetes
+- name: Install k3s, kubernetes distribution
+  include_tasks: kubernetes_install.yaml
+  when: (percona_k8s_op_pxc_version != '' or percona_k8s_op_ps_version != '' or percona_k8s_op_psmdb_version != '' or zalando_pg_op_version != '' or percona_pg_op_version != '' or (k3s_url != '' and k3s_token != '') or k3s_version != '') and kube_config == '' and kubeadm == ''
+
+- name: Python3 for run_k8s_operator.py
+  when: ansible_distribution == 'CentOS' or ansible_distribution == 'Rocky' or ansible_distribution == 'Red Hat Enterprise Linux' or ansible_distribution == 'OracleLinux'
+  yum:
+    name: "python3"
+    state: present
+    disable_gpg_check: 'yes'
+
+- name: Download yq
+  when: percona_k8s_op_pxc_version != '' or percona_k8s_op_ps_version != '' or percona_k8s_op_psmdb_version != '' or kubeadm != '' or (install_only != '' and k3s_url == '' and k3s_version != '')
+  get_url:
+    url: 'https://github.com/mikefarah/yq/releases/download/3.3.0/yq_linux_amd64'
+    dest: /usr/local/bin/yq
+    mode: '0755'
+
+- name: Install k8s with kubeadm
+  when: kubeadm_url != '' or kubeadm != ''
+  shell:
+    cmd: /bin/bash /vagrant/tools/setup_k8s_kubeadm.sh "{{ 'master' if kubeadm_url == '' else kubeadm_url }}"
+    creates: /usr/bin/kubeadm
+
+- name: helm tasks
+  when: (k3s_url == '' and k3s_version != '') or kube_config != '' or k8s_minio != '' or k8s_pmm != '' or kubeadm != ''
+  include_tasks: helm_install.yaml
+
+- name: Install kubectl
+  when: kube_config != '' and kubeadm != ''
+  block:
+    - file: path=/root/.kube state=directory mode='0755'
+    - copy:
+        src: "{{playbook_dir}}/secret/{{kube_config}}"
+        dest: /root/.kube/config
+        mode: "0600"
+        owner: root
+        group: root
+    - shell:
+        warn: false
+        cmd: curl -o /usr/bin/kubectl -LO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl; chmod +x /usr/bin/kubectl
+        creates: /usr/bin/kubectl
+
+- name: Install git for Percona Operator setup
+  package:
+    name: git
+    state: present
+
+- name: bash completion
+  package:
+    name: bash-completion
+    state: present
+
+- name: kubectl bash completion
+  when: (k3s_url == '' and k3s_version != '') or kube_config != '' or kubeadm != ''
+  shell:
+    cmd: kubectl completion bash > /etc/bash_completion.d/kubectl
+    creates: /etc/bash_completion.d/kubectl
+
+- name: Setup Operator tasks
+  when: install_only == '' and ( zalando_pg_op_version != '' or vites_version != '' )
+
+  include_tasks: setup_operators.yaml
+
+- name: Run operator
+  when: percona_k8s_op_pxc_version != "" or percona_k8s_op_ps_version != "" or percona_k8s_op_psmdb_version != "" or percona_pg_op_version != '' or k8s_pmm != '' or k8s_minio != ''
+  shell:
+    cmd: >-
+      python3 /vagrant/Docker/tools/run_k8s_operator.py \
+        --data-path=/root --helm-path=/root \
+        --operator={{ percona_k8s_op_name }} --version={{ percona_k8s_op_version }} \
+        {{'' if k8s_namespace == '' else '--namespace='+k8s_namespace}} \
+        {{'' if k8s_pmm == '' else '--pmm='+k8s_pmm}} \
+        {{'' if k8s_minio == '' else '--minio'}} \
+        {{'' if cert_manager == '' else '--cert-manager=1.7.2'}} \
+        {{'--minio-certs=self-signed' if k8s_minio != '' and cert_manager != '' else ''}} \
+        {{'--pmm-certs=self-signed' if k8s_pmm != '' and cert_manager != '' else ''}}
