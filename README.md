@@ -1,1 +1,3 @@
-Test Dosyasi 
+# ANYDBVER - TEST VERSION
+
+Bu dosya TEST branch içeriğidir.
